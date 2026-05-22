@@ -1,0 +1,34 @@
+{
+    "title": "Instagram Follower Counter (Camoufox)",
+    "description": "Fetches follower counts for Instagram usernames using Camoufox (stealthy Firefox) with multiple session rotation. Bypasses bot detection at the browser fingerprint level.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "usernames": {
+            "title": "Usernames",
+            "type": "array",
+            "description": "Instagram usernames to look up. Do not include the @ symbol.",
+            "editor": "stringList",
+            "prefill": ["cristiano", "kyliejenner"]
+        },
+        "sessions": {
+            "title": "Instagram Sessions",
+            "type": "array",
+            "description": "One entry per Instagram account. The actor rotates through them automatically when one gets rate limited.\n\nHow to get sessionId + csrfToken:\n1. Log in to Instagram in Chrome\n2. DevTools → Application → Cookies → https://www.instagram.com\n3. Copy 'sessionid' and 'csrftoken' values\n\nFormat:\n[\n  { \"sessionId\": \"abc123\", \"csrfToken\": \"xyz789\" },\n  { \"sessionId\": \"def456\", \"csrfToken\": \"uvw012\" }\n]",
+            "editor": "json",
+            "prefill": [
+                { "sessionId": "YOUR_SESSION_ID_1", "csrfToken": "YOUR_CSRF_TOKEN_1" },
+                { "sessionId": "YOUR_SESSION_ID_2", "csrfToken": "YOUR_CSRF_TOKEN_2" }
+            ]
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "editor": "proxy",
+            "description": "Residential proxies strongly recommended for Instagram.",
+            "default": { "useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"], "apifyProxyCountry": "US" },
+            "prefill": { "useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"], "apifyProxyCountry": "US" }
+        }
+    },
+    "required": ["usernames", "sessions"]
+}
