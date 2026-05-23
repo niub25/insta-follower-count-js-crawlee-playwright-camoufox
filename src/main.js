@@ -1,7 +1,6 @@
 import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
-import { launchOptions } from 'camoufox-js';
-import { firefox } from 'playwright-core';
+import { gotScraping } from 'got-scraping';
 
 await Actor.init();
 
@@ -11,6 +10,7 @@ const input = await Actor.getInput();
 const {
     usernames: inputUsernames = [],
     sessions:  inputSessions  = [],
+    concurrency               = 5,
     proxyConfiguration,
 } = input;
 
@@ -45,7 +45,7 @@ const pendingQueue = inputUsernames
         return true;
     });
 
-log.info(`Sessions: ${inputSessions.length} | Restored: ${doneUsernames.size} done | Pending: ${pendingQueue.length} | Total: ${inputUsernames.length}`);
+log.info(`Sessions: ${inputSessions.length} | Restored: ${doneUsernames.size} done | Pending: ${pendingQueue.length} | Total: ${inputUsernames.length} | Concurrency: ${concurrency}`);
 
 Actor.on('migrating', async () => {
     await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
@@ -54,10 +54,9 @@ Actor.on('migrating', async () => {
 
 // ─── Session pool ─────────────────────────────────────────────────────────────
 // Each session = one Instagram account.
-// Rotation: always pick the least-used session that isn't in cooldown.
+// Picks the least-used session that isn't cooling down.
 // On 429/block: escalating cooldown (60s → 120s → 300s → 600s).
-// Camoufox handles browser-level fingerprinting; the pool handles account-level
-// rate limiting across multiple Instagram accounts.
+// Resets consecutive fail count on any success.
 
 class SessionPool {
     constructor(sessions) {
@@ -117,67 +116,14 @@ class SessionPool {
 
 const sessionPool = new SessionPool(inputSessions);
 
-// ─── Launch Camoufox ──────────────────────────────────────────────────────────
-// Camoufox is a stealthy Firefox fork that patches the browser fingerprinting
-// APIs Instagram uses to detect headless scrapers:
-//   - navigator.webdriver → patched to undefined
-//   - Canvas/WebGL noise → randomised per session
-//   - TLS fingerprint     → real Firefox JA3/JA4 signature
-//   - Timing APIs         → human-like jitter added
-//
-// We launch ONE Camoufox instance and create one BrowserContext per session.
-// context.request.get() on each context sends the right cookies automatically
-// and goes through Firefox's real TLS stack — not Chromium's.
-
-log.info('Launching Camoufox (stealthy Firefox)...');
-
-const proxyUrl  = await proxyConfig.newUrl('camoufox_main');
-const proxyHost = proxyUrl ? new URL(proxyUrl) : null;
-
-const camoufoxOpts = await launchOptions({
-    os:       'macos',   // Spoof macOS fingerprint — most common Instagram user OS
-    headless: true,
-});
-
-const browser = await firefox.launch({
-    ...camoufoxOpts,
-    proxy: proxyHost
-        ? {
-              server:   `${proxyHost.protocol}//${proxyHost.host}`,
-              username: proxyHost.username ? decodeURIComponent(proxyHost.username) : undefined,
-              password: proxyHost.password ? decodeURIComponent(proxyHost.password) : undefined,
-          }
-        : undefined,
-});
-
-log.info(`Creating ${inputSessions.length} browser context(s)...`);
+// ─── HTTP fetch via got-scraping ──────────────────────────────────────────────
+// got-scraping handles TLS fingerprinting at the network level — the same
+// library used by Crawlee's CheerioCrawler which powers the official working
+// Apify Instagram actor.
+// Playwright's ctx.request.get() has Firefox-specific cookie handling quirks
+// that cause redirect loops on Instagram's API. got-scraping avoids this entirely.
 
 const IG_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
-
-const contexts = await Promise.all(
-    inputSessions.map(async (session, i) => {
-        const ctx = await browser.newContext({
-            userAgent: IG_UA,
-            viewport:  { width: 390, height: 844 },
-        });
-        await ctx.addCookies([
-            { name: 'sessionid', value: session.sessionId, domain: '.instagram.com', path: '/', httpOnly: true, secure: true },
-            ...(session.csrfToken
-                ? [{ name: 'csrftoken', value: session.csrfToken, domain: '.instagram.com', path: '/', secure: true }]
-                : []),
-        ]);
-        log.info(`Context #${i} ready`);
-        return ctx;
-    })
-);
-
-// ─── Fetch follower count ─────────────────────────────────────────────────────
-// Uses context.request.get() — Playwright's native HTTP client that:
-//   1. Reads cookies from the BrowserContext (our injected sessionId)
-//   2. Uses Camoufox's Firefox TLS fingerprint at the network level
-//   3. Is faster than page navigation (no HTML/JS/CSS rendering)
-//
-// On block: rotates to the next session's context automatically.
 
 const IG_HEADERS = {
     'X-IG-App-ID':      '936619743392459',
@@ -192,7 +138,6 @@ const IG_HEADERS = {
 async function fetchFollowers(username) {
     const url = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
 
-    // Try each session up to (sessions + 1) times
     for (let attempt = 0; attempt < inputSessions.length + 2; attempt++) {
         // Wait for an available session
         let session = sessionPool.acquire();
@@ -206,28 +151,30 @@ async function fetchFollowers(username) {
             session = sessionPool.acquire();
         }
 
-        const ctx = contexts[session.id];
-
         try {
-            const response = await ctx.request.get(url, {
+            const proxyUrl  = await proxyConfig.newUrl(`s${session.id}`);
+
+            const response = await gotScraping({
+                url,
+                method:          'GET',
                 headers: {
                     ...IG_HEADERS,
                     'Referer': `https://www.instagram.com/${username}/`,
-                    // Pass Cookie header explicitly — Firefox's ctx.request drops
-                    // cookies on redirects (unlike Chromium), causing a redirect loop.
-                    // Explicit header ensures cookies survive every hop.
-                    'Cookie': `sessionid=${session.sessionId}${session.csrfToken ? `; csrftoken=${session.csrfToken}` : ''}`,
+                    'Cookie':  `sessionid=${session.sessionId}${session.csrfToken ? `; csrftoken=${session.csrfToken}` : ''}`,
                     ...(session.csrfToken ? { 'X-CSRFToken': session.csrfToken } : {}),
                 },
-                timeout:      15_000,
-                maxRedirects: 0,  // Never follow redirects — a redirect = not authenticated
+                proxyUrl,
+                responseType:    'json',
+                timeout:         { request: 15_000 },
+                throwHttpErrors: false,
+                retry:           { limit: 0 },
+                followRedirect:  false,   // A redirect = not authenticated; don't follow
             });
 
-            const status = response.status();
+            const status = response.statusCode;
 
             if (status === 200) {
-                const body = await response.json();
-                const user = body?.data?.user;
+                const user = response.body?.data?.user;
                 if (!user) {
                     sessionPool.onSuccess(session);
                     return { found: false, followers: null, source: 'no_user' };
@@ -245,14 +192,8 @@ async function fetchFollowers(username) {
                 return { found: false, followers: null, source: 'not_found' };
             }
 
-            if (status === 429 || status === 401 || status === 403) {
-                sessionPool.onBlock(session);
-                continue; // rotate to next session
-            }
-
-            // 3xx redirect = Instagram is not recognising this session as authenticated
-            if (status >= 300 && status < 400) {
-                log.warning(`Session #${session.id} got redirect (${status}) — treating as auth failure`);
+            // Any block / auth failure / redirect → rotate session
+            if (status === 429 || status === 401 || status === 403 || (status >= 300 && status < 400)) {
                 sessionPool.onBlock(session);
                 continue;
             }
@@ -261,7 +202,7 @@ async function fetchFollowers(username) {
             sessionPool.onError(session);
 
         } catch (e) {
-            log.warning(`[${username}] Error on session #${session.id}: ${e.message.split('\n')[0]}`);
+            log.warning(`[${username}] Error: ${e.message?.split('\n')[0]}`);
             sessionPool.onError(session);
         }
 
@@ -273,45 +214,37 @@ async function fetchFollowers(username) {
 
 // ─── Smoke test ───────────────────────────────────────────────────────────────
 
-log.info('Running smoke test on @instagram...');
+log.info('Running smoke test...');
 const smoke = await fetchFollowers('instagram');
 
 if (smoke.found) {
     log.info(`Smoke test OK — @instagram has ${smoke.followers?.toLocaleString()} followers [${smoke.source}]`);
 } else if (smoke.source === 'all_sessions_dead') {
     log.error([
-        'ABORT — All sessions are blocked or returning redirects.',
-        'This usually means sessionId cookies are expired.',
-        'Get fresh sessionId + csrfToken from Chrome DevTools for each account and re-run.',
+        'ABORT — All sessions are blocked.',
+        'Refresh sessionId + csrfToken from Chrome DevTools for each account and re-run.',
     ].join('\n'));
-    await browser.close();
     await Actor.exit();
 } else {
-    log.warning(`Smoke test: [${smoke.source}] — proceeding anyway`);
+    log.warning(`Smoke test [${smoke.source}] — proceeding`);
 }
 
-// ─── Main loop ────────────────────────────────────────────────────────────────
-// Sequential with a small delay — Camoufox's stealth + session rotation means
-// we don't need to rush. Steady pace avoids triggering rate limits.
+// ─── Concurrent batch processor ───────────────────────────────────────────────
 
 const total     = pendingQueue.length;
 let   succeeded = 0;
 let   failed    = 0;
+let   processed = 0;
 
-log.info(`${'─'.repeat(55)}\nProcessing ${total} usernames\n${'─'.repeat(55)}`);
+log.info(`${'─'.repeat(55)}\nProcessing ${total} usernames | concurrency: ${concurrency}\n${'─'.repeat(55)}`);
 
-for (let i = 0; i < pendingQueue.length; i++) {
-    const username = pendingQueue[i];
-    const progress = `[${i + 1 + doneUsernames.size}/${total + doneUsernames.size}]`;
-
+async function processOne(username, globalIndex) {
+    const progress              = `[${globalIndex + 1 + doneUsernames.size}/${total + doneUsernames.size}]`;
     const { found, followers, source } = await fetchFollowers(username);
 
-    await Dataset.pushData({
-        username,
-        followers: followers ?? null,
-        scrapedAt: new Date().toISOString(),
-    });
+    await Dataset.pushData({ username, followers: followers ?? null, scrapedAt: new Date().toISOString() });
     doneUsernames.add(username);
+    processed++;
 
     if (found && followers !== null) {
         succeeded++;
@@ -320,30 +253,20 @@ for (let i = 0; i < pendingQueue.length; i++) {
         failed++;
         log.info(`${progress} @${username.padEnd(30)} → failed  [${source}]`);
     }
+}
 
-    // Checkpoint + session stats every 200 profiles
-    if ((i + 1) % 200 === 0 || i + 1 === pendingQueue.length) {
+for (let i = 0; i < pendingQueue.length; i += concurrency) {
+    const chunk = pendingQueue.slice(i, i + concurrency);
+    await Promise.all(chunk.map((username, j) => processOne(username, i + j)));
+
+    if (processed % 200 < concurrency || i + concurrency >= pendingQueue.length) {
         await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
-        log.info(`[checkpoint] ${i + 1} done | ${sessionPool.stats()}`);
+        log.info(`[checkpoint] ${processed} done | ${sessionPool.stats()}`);
     }
-
-    await new Promise(r => setTimeout(r, 600));
 }
 
 // ─── Teardown ─────────────────────────────────────────────────────────────────
 
-await Promise.all(contexts.map(ctx => ctx.close()));
-await browser.close();
 await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
-
-log.info([
-    `${'═'.repeat(55)}`,
-    `DONE`,
-    `  Processed : ${doneUsernames.size}`,
-    `  Succeeded  : ${succeeded}`,
-    `  Failed     : ${failed}`,
-    `  Sessions   : ${sessionPool.stats()}`,
-    `${'═'.repeat(55)}`,
-].join('\n'));
-
+log.info(`${'═'.repeat(55)}\nDONE — Processed: ${doneUsernames.size} | Succeeded: ${succeeded} | Failed: ${failed}\nSessions: ${sessionPool.stats()}\n${'═'.repeat(55)}`);
 await Actor.exit();
