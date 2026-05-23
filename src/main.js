@@ -150,7 +150,6 @@ const browser = await firefox.launch({
         : undefined,
 });
 
-// One BrowserContext per session — each has its own cookie jar
 log.info(`Creating ${inputSessions.length} browser context(s)...`);
 
 const IG_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
@@ -171,28 +170,6 @@ const contexts = await Promise.all(
         return ctx;
     })
 );
-
-// ─── Warmup ───────────────────────────────────────────────────────────────────
-// Visit Instagram homepage on each context so API calls look like in-page XHRs.
-
-log.info('Warming up sessions...');
-await Promise.all(
-    contexts.map(async (ctx, i) => {
-        const page = await ctx.newPage();
-        try {
-            await page.goto('https://www.instagram.com/', {
-                waitUntil: 'domcontentloaded',
-                timeout:   20_000,
-            });
-            await new Promise(r => setTimeout(r, 1_500));
-        } catch (e) {
-            log.warning(`Context #${i} warmup warning: ${e.message.split('\n')[0]}`);
-        } finally {
-            await page.close();
-        }
-    })
-);
-log.info('All sessions warmed up');
 
 // ─── Fetch follower count ─────────────────────────────────────────────────────
 // Uses context.request.get() — Playwright's native HTTP client that:
