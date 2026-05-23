@@ -4,7 +4,7 @@ FROM apify/actor-node-playwright-camoufox:24
 COPY package*.json ./
 
 RUN npm --quiet set progress=false \
-    && npm install --only=prod --no-optional
+    && npm install --only=prod
 
 COPY . ./
 
