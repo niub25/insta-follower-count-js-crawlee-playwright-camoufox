@@ -73,17 +73,29 @@ class SessionPool {
             requests:         0,
             consecutiveFails: 0,
             cooldownUntil:    0,
-            dead:             false,   // only true on 401/403 — permanent
+            dead:             false,  // only true on 401/403 — permanent
+            inUse:            false,  // true while a request is in flight — prevents pile-ons
         }));
     }
 
-    // Returns available session (not dead, not in cooldown), least-used first
+    // Returns available session (not dead, not in cooldown), least-used first.
+    // Per-session lock: after acquiring, the session is locked for 3s so the
+    // next concurrent request is forced onto a different session. This prevents
+    // all 5 concurrent requests stampeding a recovering session simultaneously,
+    // which would immediately re-trigger 429 and reset the cooldown to 600s.
     acquire() {
         const now       = Date.now();
         const available = this.pool
-            .filter(s => !s.dead && s.cooldownUntil <= now)
+            .filter(s => !s.dead && !s.inUse && s.cooldownUntil <= now)
             .sort((a, b) => a.requests - b.requests);
-        return available[0] ?? null;
+        const session = available[0] ?? null;
+        if (session) session.inUse = true;  // lock immediately — released after request
+        return session;
+    }
+
+    // Must be called after EVERY request (success OR failure) to free the slot
+    release(session) {
+        if (session) session.inUse = false;
     }
 
     // How long until the soonest session recovers from cooldown
@@ -230,9 +242,11 @@ async function fetchFollowers(username) {
                 if (status === 200) {
                     const user = body?.data?.user;
                     if (!user) {
+                        sessionPool.release(session);
                         sessionPool.onSuccess(session);
                         return { found: false, followers: null, source: 'no_user' };
                     }
+                    sessionPool.release(session);
                     sessionPool.onSuccess(session);
                     return {
                         found:     true,
@@ -242,30 +256,36 @@ async function fetchFollowers(username) {
                 }
 
                 if (status === 404) {
+                    sessionPool.release(session);
                     sessionPool.onSuccess(session);
                     return { found: false, followers: null, source: 'not_found' };
                 }
 
                 if (status === 429) {
+                    sessionPool.release(session);
                     sessionPool.onRateLimit(session);
                     break; // stop trying endpoints, get a different session
                 }
 
                 if (status === 401 || status === 403) {
+                    sessionPool.release(session);
                     sessionPool.onAuthFail(session, status);
                     break; // session is permanently dead
                 }
 
                 if (status >= 300 && status < 400) {
+                    sessionPool.release(session);
                     sessionPool.onRateLimit(session); // redirect = session not recognised
                     break;
                 }
 
                 log.warning(`[${username}] HTTP ${status} on session #${session.id} | ${url.includes('i.instagram') ? 'i.ig' : 'www.ig'}`);
+                sessionPool.release(session);
                 sessionPool.onError(session);
 
             } catch (e) {
                 log.warning(`[${username}] Error: ${e.message?.split('\n')[0]}`);
+                sessionPool.release(session);
                 sessionPool.onError(session);
             }
         }
